@@ -1,0 +1,60 @@
+name: Build Expo Android
+on:
+  workflow_dispatch:
+    inputs:
+      packageName:
+        description: "Android package (e.g., com.brand.app)"
+        required: true
+        type: string
+      callbackUrl:
+        description: "Your API webhook to notify on completion"
+        required: true
+        type: string
+      cbSecret:
+        description: "Webhook secret"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Install deps
+        run: |
+          npm ci
+          npm i -g eas-cli
+
+      - name: EAS build (Android)
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          eas build -p android --non-interactive --profile production --json > build.json
+          cat build.json
+
+      - name: Parse artifact
+        id: parse
+        run: |
+          ART_URL=$(cat build.json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let j=JSON.parse(d);console.log(j[0].artifacts.buildUrl||'');}catch(e){console.log('')}})")
+          echo "artifact=$ART_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload to Backblaze (optional)
+        if: steps.parse.outputs.artifact != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APP_KEY }}
+          AWS_EC2_METADATA_DISABLED: true
+        run: |
+          sudo apt-get update && sudo apt-get install -y awscli
+          curl -L "${{ steps.parse.outputs.artifact }}" -o app.apk
+          aws --endpoint-url https://s3.us-east-005.backblazeb2.com s3 cp app.apk s3://${{ secrets.B2_BUCKET_BUILDS }}/apk/${{ github.run_id }}.apk --acl private
+
+      - name: Callback → your API
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -H "X-CB-SECRET: ${{ github.event.inputs.cbSecret }}" \
+          -d "{\"status\":\"success\",\"type\":\"expo\",\"artifactUrl\":\"${{ steps.parse.outputs.artifact }}\",\"b2Key\":\"apk/${{ github.run_id }}.apk\"}" \
+          "${{ github.event.inputs.callbackUrl }}"
